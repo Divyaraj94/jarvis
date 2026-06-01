@@ -1,0 +1,3 @@
+Hey Jarvis! Can you write a multi-line python script using the new <PYTHON> tag to fetch the top 3 tech news headlines from Hacker News (https://hacker-news.firebaseio.com/v0/topstories.json - note that this endpoint returns a list of integer IDs directly, so data[i] is the story ID itself) and print them?
+y
+die
