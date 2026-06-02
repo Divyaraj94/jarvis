@@ -2,11 +2,16 @@ import sys
 import os
 import re
 import subprocess
+import threading
+
+# Fix Windows console encoding for emoji support
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 from dotenv import load_dotenv
 from brain import CloudBrain, LocalBrain
 from memory import MemorySystem
-from voice import voice
-from wake_word import wake_word_system
 
 # Load environment variables from .env file
 load_dotenv()
@@ -14,51 +19,165 @@ load_dotenv()
 class Jarvis:
     def __init__(self):
         self.alive = True
-        self.brain_mode = "local" # Default to local mode
+        self.brain_mode = "local"  # Default to local mode (Ollama)
         self.brain = None
         self.history = []
         self.memory = MemorySystem()
 
-        print("[System] Jarvis initializing...")
-        print("[System] Type '/switch cloud' or '/switch local' to toggle AI modes.")
+        # Voice & Wake Word — initialized gracefully
+        self.voice = None
+        self.wake_word = None
+        self.voice_enabled = False
+        self.wake_word_enabled = False
+
+        print("\n" + "="*50)
+        print("   🤖 JARVIS: Initializing Systems...")
+        print("="*50)
+
+        # 1. Setup Brain
         self.setup_brain()
+
+        # 2. Setup Voice (primary input)
+        self.setup_voice()
+
+        # 3. Setup Wake Word
+        self.setup_wake_word()
+
+        # Print status summary
+        print("\n" + "-"*50)
+        print("   📊 System Status:")
+        print(f"   🧠 Brain:     {'✅ ' + self.brain_mode.upper() if self.brain else '❌ Offline'}")
+        print(f"   🎤 Voice:     {'✅ Active' if self.voice_enabled else '❌ Disabled (text-only mode)'}")
+        print(f"   👂 Wake Word: {'✅ Listening for Hey Jarvis' if self.wake_word_enabled else '❌ Disabled'}")
+        print("-"*50)
+
+        if self.voice_enabled:
+            print("\n[System] 🎙️  Voice is PRIMARY. Type in terminal as backup.")
+            print("[System] Say 'Hey Jarvis' to activate, or just type below.")
+        else:
+            print("\n[System] ⌨️  Running in TEXT-ONLY mode (voice unavailable).")
+
+        print("[System] Type '/switch cloud' or '/switch local' to toggle AI modes.")
+        print("[System] Type '/clear' to clear conversation history.")
+        print("[System] Type 'exit' or 'quit' to shut down.\n")
 
     def setup_brain(self):
         try:
             if self.brain_mode == "cloud":
-                print("[System] Connecting to Cloud AI (Gemini)...")
+                print("[System] 🧠 Connecting to Cloud AI (Gemini)...")
                 self.brain = CloudBrain()
             else:
-                print("[System] Connecting to Local AI (Ollama)...")
+                print("[System] 🧠 Connecting to Local AI (Ollama)...")
                 self.brain = LocalBrain()
-            print(f"[System] Brain connected in {self.brain_mode.upper()} mode. Breathing in...")
+            print(f"[System] ✅ Brain connected in {self.brain_mode.upper()} mode.")
         except Exception as e:
-            print(f"[System] Failed to initialize {self.brain_mode} brain: {e}")
-            self.brain = None # Keep brain offline until fixed
+            print(f"[System] ❌ Failed to initialize {self.brain_mode} brain: {e}")
+            self.brain = None
+
+    def setup_voice(self):
+        """Initialize voice system gracefully — if it fails, we fall back to text."""
+        try:
+            from voice import VoiceSystem
+            self.voice = VoiceSystem()
+            self.voice_enabled = True
+            print("[System] ✅ Voice system initialized.")
+        except Exception as e:
+            print(f"[System] ⚠️  Voice unavailable: {e}")
+            print("[System] Falling back to text-only input.")
+            self.voice = None
+            self.voice_enabled = False
+
+    def setup_wake_word(self):
+        """Initialize wake word system gracefully — if it fails, voice still works on demand."""
+        if not self.voice_enabled:
+            print("[System] ⚠️  Wake word skipped (voice is disabled).")
+            return
+
+        try:
+            from wake_word import WakeWordSystem
+            self.wake_word = WakeWordSystem()
+            self.wake_word_enabled = True
+            print("[System] ✅ Wake word system initialized.")
+        except Exception as e:
+            print(f"[System] ⚠️  Wake word unavailable: {e}")
+            print("[System] Voice will work via terminal trigger instead.")
+            self.wake_word = None
+            self.wake_word_enabled = False
+
+    def speak(self, text):
+        """Speak text if voice is available, otherwise just print."""
+        if self.voice and self.voice_enabled:
+            self.voice.speak(text)
+        # Text is always printed in think() regardless
 
     def listen(self):
-        """Hybrid input: Wake Word -> Voice -> Text."""
-        print("\n[System] Jarvis is in passive mode. Say 'Alexa' (or your wake word) to activate...")
+        """
+        Hybrid input system:
+        - If wake word is active: listens in background, activates on 'Hey Jarvis'
+        - Text input is always available as fallback
+        - Uses threading so both can work simultaneously
+        - Crucial: Voice output (TTS) and recording (STT) are run strictly on the main thread
+          to prevent COM/apartment conflicts and audio device sharing locks.
+        """
+        result = {"text": None, "source": None}
 
-        while self.alive:
-            # 1. Check for Wake Word
-            if wake_word_system.listen():
-                print("\n[System] Wake word detected! Jarvis is now listening...")
-                voice.speak("Yes, sir?")
+        def text_input_thread():
+            """Thread for terminal text input."""
+            try:
+                user_input = input("You > ")
+                if user_input.strip():
+                    result["text"] = user_input.strip()
+                    result["source"] = "text"
+            except EOFError:
+                pass
 
-                # Once woken up, use the high-accuracy voice listener
-                voice_input = voice.listen()
-                if voice_input:
-                    return voice_input
+        def voice_listen_thread():
+            """Thread for wake word detection only."""
+            while result["text"] is None and self.alive:
+                try:
+                    if self.wake_word and self.wake_word_enabled:
+                        if self.wake_word.listen():
+                            result["source"] = "voice"
+                            result["text"] = "__WAKE_WORD_TRIGGERED__"
+                            return
+                    else:
+                        # No wake word — don't burn CPU
+                        import time
+                        time.sleep(0.5)
+                except Exception:
+                    import time
+                    time.sleep(0.5)
 
-            # 2. Fallback: Allow terminal input as a manual trigger
-            # We use a non-blocking check if possible, but for simplicity,
-            # if you type something in the terminal, it should also trigger.
-            # Note: input() is blocking, so we can't easily mix it with the wake word loop
-            # without threading. For this MVP, we'll rely on the wake word.
-            # To allow terminal input, you can press Enter.
+        # Start text input thread
+        text_thread = threading.Thread(target=text_input_thread, daemon=True)
+        text_thread.start()
 
-        return ""
+        # Start voice thread if voice is enabled
+        if self.voice_enabled and self.wake_word_enabled:
+            voice_thread = threading.Thread(target=voice_listen_thread, daemon=True)
+            voice_thread.start()
+
+        # Wait for either input method to produce a result
+        while result["text"] is None and self.alive:
+            import time
+            time.sleep(0.1)
+
+        # Process the result on the MAIN thread
+        if result["source"] == "voice":
+            print("\n🟢 [Wake word detected!] Jarvis is now listening...")
+            # Pause wake word to release input stream lock
+            self.wake_word.pause()
+            
+            # Speak and record on the main thread (thread-safe!)
+            self.speak("Yes, sir?")
+            voice_input = self.voice.listen()
+            
+            # Resume wake word for the next turn
+            self.wake_word.resume()
+            
+            return voice_input or ""
+
+        return result["text"] or ""
 
     def process_system_command(self, command):
         """Handle internal commands like toggling AI modes."""
@@ -69,7 +188,7 @@ class Jarvis:
                 if new_mode != self.brain_mode:
                     self.brain_mode = new_mode
                     self.setup_brain()
-                    self.history = [] # Clear history on switch
+                    self.history = []  # Clear history on switch
                 else:
                     print(f"[Jarvis] Already in {new_mode} mode.")
             else:
@@ -78,6 +197,13 @@ class Jarvis:
         elif parts[0] == "/clear":
             self.history = []
             print("[Jarvis] Conversation history cleared.")
+            return True
+        elif parts[0] == "/voice":
+            if self.voice_enabled:
+                print("[System] Voice is already active.")
+            else:
+                self.setup_voice()
+                self.setup_wake_word()
             return True
         return False
 
@@ -90,6 +216,7 @@ class Jarvis:
         # The "Oxygen" mechanism - dying if commanded
         if command_lower in ["die", "kill", "exit", "quit", "stop"]:
             print("\n[Jarvis] Oxygen supply severed... I am shutting down...")
+            self.speak("Goodbye, sir. It was an honor serving you.")
             self.alive = False
             return False
 
@@ -103,7 +230,7 @@ class Jarvis:
             print(f"[Jarvis] My {self.brain_mode} brain is currently offline. Please check your configuration or switch modes.")
             return True
 
-        print(f"[Jarvis] Thinking in 4D ({self.brain_mode.upper()})...")
+        print(f"\n[Jarvis] 🔄 Thinking in 4D ({self.brain_mode.upper()})...")
 
         import datetime
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -161,8 +288,8 @@ class Jarvis:
 
         response = self.brain.think(messages)
 
-        # Speak the response aloud
-        voice.speak(response)
+        # Speak the response aloud (this also handles cleaning XML tags)
+        self.speak(response)
         print(f"\n[Jarvis] {response}")
 
         self.history.append({"role": "assistant", "content": response})
@@ -177,36 +304,84 @@ class Jarvis:
             if ":" in match:
                 key, value = match.split(":", 1)
                 self.memory.save_fact(key.strip(), value.strip())
-                print(f"[System] Memory Updated: {key.strip()} -> {value.strip()}")
+                print(f"[System] 💾 Memory Updated: {key.strip()} -> {value.strip()}")
 
         # Check if Jarvis wants to execute a terminal command
         execute_match = re.search(r'<EXECUTE>\s*(.*?)\s*</EXECUTE>', response, re.IGNORECASE | re.DOTALL)
         python_match = re.search(r'<PYTHON>\s*(.*?)\s*</PYTHON>', response, re.IGNORECASE | re.DOTALL)
 
         cmd_to_run = None
+        cmd_description = None
         if python_match:
             py_code = python_match.group(1).strip()
             with open("jarvis_temp.py", "w", encoding="utf-8") as f:
                 f.write(py_code)
             cmd_to_run = "python jarvis_temp.py"
-            print(f"\n[System] Jarvis wrote a python script and wants to execute it.")
+            cmd_description = "a Python script"
+            print(f"\n[System] 📝 Jarvis wrote a Python script and wants to execute it.")
         elif execute_match:
             cmd_to_run = execute_match.group(1).strip()
-            print(f"\n[System] Jarvis wants to execute: {cmd_to_run}")
+            cmd_description = cmd_to_run
+            print(f"\n[System] 💻 Jarvis wants to execute: {cmd_to_run}")
 
         if cmd_to_run:
             confirm = input("[System] Allow execution? (y/n): ")
             if confirm.lower() == 'y':
                 try:
-                    result = subprocess.run(cmd_to_run, shell=True, capture_output=True, text=True)
+                    print(f"[System] ⚡ Executing {cmd_description}...")
+                    result = subprocess.run(cmd_to_run, shell=True, capture_output=True, text=True, timeout=30)
                     output = result.stdout if result.stdout else result.stderr
                     if not output.strip():
                         output = "Command executed successfully with no output."
-                    print(f"[System] Command Output:\n{output.strip()}")
+                    print(f"[System] ✅ Command Output:\n{output.strip()}")
+
                     # Feed the result back into history so Jarvis knows it worked
                     self.history.append({"role": "system", "content": f"Command executed. Output:\n{output.strip()}"})
+
+                    # === AUTO-THINK: Let Jarvis interpret the results ===
+                    print(f"\n[Jarvis] 🔄 Processing results...")
+                    follow_up_messages = [system_message] + self.history
+                    follow_up_response = self.brain.think(follow_up_messages)
+
+                    # Speak and display the follow-up
+                    self.speak(follow_up_response)
+                    print(f"\n[Jarvis] {follow_up_response}")
+                    self.history.append({"role": "assistant", "content": follow_up_response})
+
+                    # Archive the follow-up too
+                    self.memory.add_conversation_memory(f"System Output: {output.strip()}\nJarvis: {follow_up_response}")
+
+                    # Check if the follow-up also contains commands (recursive execution)
+                    follow_execute = re.search(r'<EXECUTE>\s*(.*?)\s*</EXECUTE>', follow_up_response, re.IGNORECASE | re.DOTALL)
+                    follow_python = re.search(r'<PYTHON>\s*(.*?)\s*</PYTHON>', follow_up_response, re.IGNORECASE | re.DOTALL)
+
+                    if follow_execute or follow_python:
+                        # If Jarvis wants to run another command after seeing results,
+                        # recursively process it
+                        if follow_python:
+                            py_code = follow_python.group(1).strip()
+                            with open("jarvis_temp.py", "w", encoding="utf-8") as f:
+                                f.write(py_code)
+                            next_cmd = "python jarvis_temp.py"
+                            print(f"\n[System] 📝 Jarvis wants to run another script based on the results.")
+                        else:
+                            next_cmd = follow_execute.group(1).strip()
+                            print(f"\n[System] 💻 Jarvis wants to execute another command: {next_cmd}")
+
+                        confirm2 = input("[System] Allow execution? (y/n): ")
+                        if confirm2.lower() == 'y':
+                            result2 = subprocess.run(next_cmd, shell=True, capture_output=True, text=True, timeout=30)
+                            output2 = result2.stdout if result2.stdout else result2.stderr
+                            if not output2.strip():
+                                output2 = "Command executed successfully with no output."
+                            print(f"[System] ✅ Command Output:\n{output2.strip()}")
+                            self.history.append({"role": "system", "content": f"Command executed. Output:\n{output2.strip()}"})
+
+                except subprocess.TimeoutExpired:
+                    print("[System] ⏰ Command timed out after 30 seconds.")
+                    self.history.append({"role": "system", "content": "Command timed out after 30 seconds."})
                 except Exception as e:
-                    print(f"[System] Execution failed: {e}")
+                    print(f"[System] ❌ Execution failed: {e}")
                     self.history.append({"role": "system", "content": f"Command failed: {e}"})
             else:
                 print("[System] Execution cancelled by user.")
@@ -221,7 +396,10 @@ class Jarvis:
             
             if not success:
                 print("[System] Jarvis has died. Exiting program.")
-                sys.exit(1)
+                # Cleanup
+                if self.wake_word:
+                    self.wake_word.stop()
+                sys.exit(0)
 
 if __name__ == "__main__":
     jarvis = Jarvis()

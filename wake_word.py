@@ -1,6 +1,3 @@
-import openwakeword
-from openwakeword.model import Model
-import pyaudio
 import numpy as np
 import collections
 
@@ -8,61 +5,89 @@ class WakeWordSystem:
     """
     The 'Intuition' of JARVIS.
     Listens for a specific keyword to activate the assistant.
+    Uses sounddevice instead of PyAudio (no Python 3.14 wheels for PyAudio).
     """
-    def __init__(self, wake_word="alexa"):
-        # Note: openWakeWord comes with a few default models like 'alexa', 'hey google', etc.
-        # For a custom 'Jarvis' word, we'd typically load a custom .tflite or .onnx model.
-        # For this MVP, we will use 'alexa' as a proxy for 'Jarvis' until a custom model is loaded,
-        # or we can implement a fallback using simple speech recognition.
+    def __init__(self, wake_word="hey_jarvis_v0.1"):
+        import sounddevice as sd
+        from openwakeword.model import Model
 
         print("[System] Loading Wake Word engine...")
-        self.oww_model = Model(wakeword_models=None, inference_framework="onnx")
 
-        # Use the default models provided by the library
-        self.model = self.oww_model.get_model(wake_word)
-
-        # Audio stream setup
-        self.audio = pyaudio.PyAudio()
-        self.stream = self.audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=128
+        # Load the model with ONNX inference framework
+        self.oww_model = Model(
+            wakeword_models=[wake_word],
+            inference_framework="onnx"
         )
+        self.wake_word = wake_word
 
-        self.buffer = collections.deque(maxlen=128)
+        # Audio stream setup using sounddevice
+        self.sd = sd
+        self.sample_rate = 16000
+        self.chunk_size = 1280  # openwakeword expects 1280 samples (80ms at 16kHz)
+
+        # Start an input stream
+        self.stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype='int16',
+            blocksize=self.chunk_size
+        )
+        self.stream.start()
+
         print(f"[System] Wake Word system active. Listening for '{wake_word}'...")
 
     def listen(self):
         """
-        Continuously monitors audio. Returns True if wake word is detected.
+        Reads one chunk of audio and checks for wake word.
+        Returns True if wake word is detected.
         """
-        # Read audio from stream
-        data = self.stream.read(128, exception_on_overflow=False)
-        # Convert to numpy array
-        audio_data = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        try:
+            # Read audio from the sounddevice stream
+            data, overflowed = self.stream.read(self.chunk_size)
 
-        # Add to buffer
-        self.buffer.extend(audio_data)
+            # Convert to the format openwakeword expects (flat int16 numpy array)
+            audio_data = data.flatten()
 
-        # If buffer is full, run inference
-        if len(self.buffer) == 128:
-            input_data = np.array(self.buffer)
-            # Run the model
-            prediction = self.model.predict(input_data)
+            # Run prediction
+            prediction = self.oww_model.predict(audio_data)
 
-            # If prediction probability is high enough (usually > 0.5)
-            if prediction > 0.5:
-                return True
+            # Check all model predictions
+            for model_name, score in prediction.items():
+                if score > 0.5:
+                    # Reset the model after detection to avoid repeated triggers
+                    self.oww_model.reset()
+                    return True
+
+        except Exception as e:
+            # Silently handle audio read errors to keep the loop alive
+            pass
 
         return False
 
+    def pause(self):
+        """Pause the audio stream."""
+        try:
+            if self.stream.active:
+                self.stream.stop()
+        except Exception:
+            pass
+
+    def resume(self):
+        """Resume the audio stream."""
+        try:
+            if not self.stream.active:
+                self.oww_model.reset()
+                self.stream.start()
+        except Exception:
+            pass
+
     def stop(self):
         """Clean up audio streams."""
-        self.stream.stop_stream()
-        self.stream.close()
-        self.audio.terminate()
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
 
-# Default instance
-wake_word_system = WakeWordSystem()
+
+# NOTE: No global instance here. Instantiated in main.py with error handling.

@@ -6,6 +6,7 @@ pyautogui
 psutil
 SpeechRecognition
 pyttsx3
-pyaudio
+sounddevice
+numpy
 openwakeword
 onnxruntime

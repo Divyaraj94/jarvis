@@ -1,1 +1,19 @@
 .env
+PHASE_2_PLAN.md
+PROJECT_PLAN.md
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Databases
+jarvis_memory.db
+chroma_db/
+
+# Temp scripts
+jarvis_temp.py
+test_*.txt
+verify_voice.py
+
+# Path artifacts
+CUsers*
